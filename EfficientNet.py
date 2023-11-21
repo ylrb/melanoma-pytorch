@@ -12,9 +12,9 @@ from PIL import Image
 from datetime import datetime
 import time
 import numpy as np
-from efficientnet_pytorch import EfficientNet
-from RandAugment import RandAugment
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import StepLR
+from torch.utils.tensorboard import SummaryWriter
 
 # Définit le dataset à partir des fichiers fournis
 class CustomDataset(Dataset):
@@ -47,13 +47,18 @@ print(datetime.now())
 print("Running on GPU:", torch.cuda.is_available())
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+writer = SummaryWriter("logs3", comment="EfficientNet-b0")
+
 # Liens des images et des labels
-data_folder = "cvml-pytorch-main/isic-2020-resized/train-resized"
-label_file = "cvml-pytorch-main/isic-2020-resized/train-labels.csv"
+data_folder_2020 = "isic-2020-resized/train-resized"
+label_file_2020 = "isic-2020-resized/train-labels.csv"
+
+data_folder_2019 = "isic-2019-resized/train-resized"
+label_file_2019 = "isic-2019-resized/train-labels.csv"
 
 # Initialise le modèle utilisé pour le fine-tuning et modifie le dernier fully connected pour notre classification binaire
-model = EfficientNet.from_pretrained('efficientnet-b0')
-model._fc = nn.Linear(model._fc.in_features, 2)
+model = models.efficientnet_b0(weights='IMAGENET1K_V1')
+model.classifier[1] = nn.Linear(1280, 2)
 model = model.to(device)
 
 # Hyperparamètres de l'entraînement
@@ -63,13 +68,12 @@ l2_reg = 0.0001
 num_epochs = 20
 
 # Fonction de coût et optimiseur utilisés
-#optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=l2_reg)
 optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=l2_reg)
-#optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=l2_reg, momentum=0.9)
 
 # Charge les labels et les divise en un dataset d'entraînement et un dataset de validation (90% entraînement, 10% validation)
-labels = pd.read_csv(label_file)
-train_dataframe, val_dataframe = train_test_split(labels, test_size=0.1, random_state=42)
+labels_2020 = pd.read_csv(label_file_2020)
+labels_2019 = pd.read_csv(label_file_2019)
+train_dataframe, val_dataframe = train_test_split(labels_2020, test_size=0.1, random_state=42)
 
 # Définit les transormations appliquées aux images
 transform = transforms.Compose([
@@ -79,21 +83,24 @@ transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-N = 3
-M = np.random.poisson(12)/30
-#transform.transforms.insert(0, RandAugment(N, M))
-
 # Crée les deux datasets à partir des deux dataframes, en appliquant les transformations aux images
-train_dataset = CustomDataset(data_folder, train_dataframe, transform)
-val_dataset = CustomDataset(data_folder, val_dataframe, transform)
+train_dataset_2020 = CustomDataset(data_folder_2020, train_dataframe, transform)
+train_dataset_2019 = CustomDataset(data_folder_2019, labels_2019, transform)
+val_dataset = CustomDataset(data_folder_2020, val_dataframe, transform)
+
+train_dataset = torch.utils.data.ConcatDataset([train_dataset_2020, train_dataset_2019])
 
 # Calcule les poids des deux classes puis crée un sampler avec WeightedRandomSampler
-labels_weights = 1.0 / train_dataframe['target'].value_counts()
+labels_weights = train_dataframe['target'].value_counts()
+labels_weights[1] = labels_2019['target'].value_counts()
+print("Original label weights ratio:", labels_weights[0]/labels_weights[1])
+labels_weights = 1.0 / labels_weights
 class_weights = labels_weights[train_dataframe['target']]
 sampler = WeightedRandomSampler(torch.FloatTensor(class_weights.values), len(train_dataset))
 
-#criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 30.0]).to(device))
-criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 10.0]).to(device))
+criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 13.0]).to(device))
+
+scheduler = StepLR(optimizer, step_size=1, gamma=0.1)
 
 # Boucle d'entraînement
 print("Starting")
@@ -107,7 +114,7 @@ for epoch in range(num_epochs):
     total_total = 0
 
     # Traitement d'un minibatch, en rendomizant le dataloader à chaque passage
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=4)
     for inputs, labels in train_loader:
         inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
@@ -116,7 +123,7 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
-
+        
         # Calcule l'accuracy globale et pour les deux classes séparément
         _, predicted = torch.max(outputs, 1)
         for i in range(len(predicted)):
@@ -134,8 +141,17 @@ for epoch in range(num_epochs):
     accuracy_class0 = correct_class0 / total_class0 * 100
     accuracy_class1 = correct_class1 / total_class1 * 100
 
-    print(f"Epoch: {epoch + 1}/{num_epochs} - Loss: {total_loss/len(train_loader):.4f} - Time: {format_time(time.time() - start_time)} - Acc.: {accuracy:.2f}% (0: {accuracy_class0:.2f}%, 1: {accuracy_class1:.2f}%)")
+    print(f'Epoch: {epoch + 1}/{num_epochs} - Loss: {total_loss/len(train_loader):.4f} - Time: {format_time(time.time() - start_time)} - Acc.: {accuracy:.2f}% (0: {accuracy_class0:.2f}%, 1: {accuracy_class1:.2f}%) - LR: {optimizer.param_groups[0]["lr"]}')
+    writer.add_scalar("Training/Loss", total_loss/len(train_loader), epoch)
+    writer.add_scalar("Training/Accuracy", accuracy, epoch)
+    writer.add_scalar("Training/Accuracy (class 0)", accuracy_class0, epoch)
+    writer.add_scalar("Training/Accuracy (class 1)", accuracy_class1, epoch)
+    writer.add_scalar("Learning rate", optimizer.param_groups[0]["lr"], epoch)
+    
+    torch.save(model.state_dict(), 'EfficientNet-'+str(epoch + 1)+'-l2reg0.001.pth')
 
+    scheduler.step()
+    
     # Boucle de validation
     model.eval()
     total_val_loss = 0.0
@@ -146,7 +162,7 @@ for epoch in range(num_epochs):
     total_val_class0 = 0
     total_val_class1 = 0
 
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, num_workers=4)
     with torch.no_grad():
         for inputs, labels in val_loader:
             inputs, labels = inputs.to(device), labels.to(device)
@@ -172,9 +188,9 @@ for epoch in range(num_epochs):
         val_accuracy_class1 = correct_val_class1 / total_val_class1 * 100
 
         print(f"Validation Accuracy: {val_accuracy:.2f}% (0: {val_accuracy_class0:.2f}%, 1: {val_accuracy_class1:.2f}%)")
-
-
-# Sauvegarde le modèle
-torch.save(model.state_dict(), 'resnet18-'+str(datetime.now())+'.pth')
+        writer.add_scalar("Validation/Accuracy", val_accuracy, epoch)
+        writer.add_scalar("Validation/Accuracy (class 0)", val_accuracy_class0, epoch)
+        writer.add_scalar("Validation/Accuracy (class 1)", val_accuracy_class1, epoch)
 
 print("Training completed!")
+writer.close()
